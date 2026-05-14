@@ -1,0 +1,116 @@
+[workspace]
+members = [
+    "harnesses/harness-common",
+    "harnesses/fuzz_p2p_version",
+    "harnesses/fuzz_p2p_verack",
+    "harnesses/fuzz_p2p_ping",
+    "harnesses/fuzz_p2p_pong",
+    "harnesses/fuzz_p2p_addr",
+    "harnesses/fuzz_p2p_addrv2",
+    "harnesses/fuzz_p2p_inv",
+    "harnesses/fuzz_p2p_getdata",
+    "harnesses/fuzz_p2p_getblocks",
+    "harnesses/fuzz_p2p_getheaders",
+    "harnesses/fuzz_p2p_tx",
+    "harnesses/fuzz_p2p_block",
+    "harnesses/fuzz_p2p_headers",
+    "harnesses/fuzz_p2p_notfound",
+    "harnesses/fuzz_p2p_reject",
+    "harnesses/fuzz_p2p_mempool",
+    "harnesses/fuzz_p2p_sendheaders",
+    "harnesses/fuzz_p2p_feefilter",
+    "harnesses/fuzz_p2p_sequence",
+    "harnesses/fuzz_tx_v4",
+    "harnesses/fuzz_tx_v5",
+    "harnesses/fuzz_tx_transparent",
+    "harnesses/fuzz_tx_sapling",
+    "harnesses/fuzz_tx_orchard",
+    "harnesses/fuzz_block_deser",
+    "harnesses/fuzz_merkle_tree",
+    "harnesses/fuzz_note_commitment_tree",
+    "harnesses/fuzz_sighash_computation",
+    "harnesses/fuzz_script_pubkey",
+    "harnesses/fuzz_script_sig",
+    "harnesses/fuzz_address",
+    "harnesses/fuzz_rpc_json_request",
+    "harnesses/fuzz_rpc_sendrawtransaction",
+    "harnesses/fuzz_equihash_solution",
+    "harnesses/fuzz_redjubjub_sig",
+    "harnesses/fuzz_orchard_proof",
+    "harnesses/fuzz_halo2_verifier",
+    "harnesses/fuzz_p2p_concurrent_stress",
+    "harnesses/fuzz_unsafe_blocks",
+    "harnesses/fuzz_codec_roundtrip",
+    "crash-triage",
+    "symbolic-exec",
+]
+resolver = "2"
+
+[workspace.package]
+authors     = ["Zebra Security Audit Team <security@audit.local>"]
+license     = "MIT OR Apache-2.0"
+edition     = "2021"
+rust-version = "1.85.1"
+
+# ── Shared dependencies (mirrors the main workspace) ──────────────────────────
+[workspace.dependencies]
+# Zebra crates (path-relative from this workspace)
+zebra-chain   = { path = "../zebra-chain",   features = ["proptest-impl", "json-conversion"] }
+zebra-network = { path = "../zebra-network",  features = ["proptest-impl"] }
+zebra-rpc     = { path = "../zebra-rpc" }
+zebra-script  = { path = "../zebra-script" }
+zebra-state   = { path = "../zebra-state",    features = ["proptest-impl"] }
+zebra-test    = { path = "../zebra-test" }
+
+# Fuzzing engines
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+arbitrary     = { version = "1",   features = ["derive"] }
+honggfuzz     = "0.5"
+afl           = "0.15"
+
+# Crypto / serialisation
+byteorder     = "1.5"
+bytes         = "1.10"
+hex           = "0.4"
+rand          = "0.8"
+rand_core     = "0.6"
+
+# Async
+tokio         = { version = "1", features = ["full"] }
+futures       = "0.3"
+
+# Error handling
+color-eyre    = { version = "0.6", default-features = false }
+thiserror     = "2.0"
+anyhow        = "1"
+
+# Serialization
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+
+# Proptest
+proptest      = "1"
+
+# Tracing
+tracing       = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Zcash ecosystem
+equihash      = "0.3"
+orchard       = "0.13"
+redjubjub     = "0.8"
+sapling-crypto = "0.7"
+zcash_primitives = "0.27"
+zcash_address = "0.11"
+zcash_encoding = "0.4"
+
+[profile.fuzz]
+inherits      = "dev"
+opt-level     = 1
+debug         = true
+overflow-checks = true
+
+[profile.release]
+panic         = "abort"
+lto           = "thin"
+debug         = "line-tables-only"

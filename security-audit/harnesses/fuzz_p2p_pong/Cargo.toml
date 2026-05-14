@@ -1,0 +1,22 @@
+[package]
+name    = "fuzz_p2p_pong"
+version = "0.1.0"
+edition = "2021"
+description = "Fuzz P2P pong message deserialisation"
+
+[[bin]]
+name = "fuzz_p2p_pong"
+path = "src/main.rs"
+
+[dependencies]
+harness-common = { path = "../harness-common" }
+zebra-chain    = { path = "../../zebra-chain",  features = ["proptest-impl", "json-conversion"] }
+zebra-network  = { path = "../../zebra-network", features = ["proptest-impl"] }
+libfuzzer-sys  = { version = "0.4", features = ["arbitrary-derive"] }
+arbitrary      = { version = "1",   features = ["derive"] }
+byteorder      = "1.5"
+bytes          = "1.10"
+hex            = "0.4"
+rand           = "0.8"
+tokio          = { version = "1", features = ["full"] }
+tracing        = "0.1"

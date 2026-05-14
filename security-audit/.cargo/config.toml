@@ -1,0 +1,29 @@
+# Cargo configuration for the Zebra security audit workspace.
+
+[build]
+# Use all available cores for compilation.
+jobs = 0
+
+[profile.fuzz]
+# Optimisation level 1 gives good performance while preserving debug info.
+opt-level = 1
+debug = true
+overflow-checks = true
+# Do not abort on panic — let the fuzzer catch panics.
+panic = "unwind"
+
+[profile.fuzz-release]
+inherits = "release"
+# Keep debug info for symbolisation.
+debug = "line-tables-only"
+overflow-checks = true
+
+# ── Sanitiser build aliases ───────────────────────────────────────────────────
+# Use: cargo asan build --package fuzz_p2p_version
+
+[alias]
+asan    = ["build", "--config", "build.rustflags=[\"-Zsanitizer=address\",\"-C\",\"opt-level=1\",\"-C\",\"debuginfo=2\"]"]
+msan    = ["build", "--config", "build.rustflags=[\"-Zsanitizer=memory\",\"-Zsanitizer-memory-track-origins=2\",\"-C\",\"opt-level=1\",\"-C\",\"debuginfo=2\"]"]
+ubsan   = ["build", "--config", "build.rustflags=[\"-Zsanitizer=undefined\",\"-C\",\"opt-level=1\",\"-C\",\"debuginfo=2\"]"]
+tsan    = ["build", "--config", "build.rustflags=[\"-Zsanitizer=thread\",\"-C\",\"opt-level=1\",\"-C\",\"debuginfo=2\"]"]
+cov     = ["build", "--config", "build.rustflags=[\"-C\",\"instrument-coverage\",\"-C\",\"opt-level=0\",\"-C\",\"debuginfo=2\"]"]

@@ -1,0 +1,27 @@
+[package]
+name    = "fuzz_tx_orchard"
+version = "0.1.0"
+edition = "2021"
+description = "Fuzz Orchard action bundle deserialisation"
+
+[[bin]]
+name = "fuzz_tx_orchard"
+path = "src/main.rs"
+
+[dependencies]
+harness-common = { path = "../harness-common" }
+zebra-chain    = { path = "../../zebra-chain",  features = ["proptest-impl", "json-conversion"] }
+zebra-network  = { path = "../../zebra-network", features = ["proptest-impl"] }
+zebra-script   = { path = "../../zebra-script" }
+libfuzzer-sys  = { version = "0.4", features = ["arbitrary-derive"] }
+arbitrary      = { version = "1",   features = ["derive"] }
+byteorder      = "1.5"
+bytes          = "1.10"
+hex            = "0.4"
+rand           = "0.8"
+tokio          = { version = "1", features = ["full"] }
+tracing        = "0.1"
+equihash       = "0.3"
+orchard        = "0.13"
+redjubjub      = "0.8"
+sapling-crypto = "0.7"
