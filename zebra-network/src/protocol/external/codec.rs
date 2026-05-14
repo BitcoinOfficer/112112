@@ -502,44 +502,92 @@ impl Codec {
     /// Note: zcashd only requires fields up to `address_recv`, but everything up to `relay` is required in Zebra.
     ///       see <https://github.com/zcash/zcash/blob/11d563904933e889a11d9685c3b249f1536cfbe7/src/main.cpp#L6490-L6507>
     fn read_version<R: Read>(&self, mut reader: R) -> Result<Message, Error> {
+        let version = Version(reader.read_u32::<LittleEndian>()?);
+        let services = PeerServices::from_bits_truncate(reader.read_u64::<LittleEndian>()?);
+        
+        // Parse and validate timestamp
+        let timestamp_i64 = reader.read_i64::<LittleEndian>()?;
+        let timestamp = Utc
+            .timestamp_opt(timestamp_i64, 0)
+            .single()
+            .ok_or(Error::Parse(
+                "version timestamp is out of range for DateTime",
+            ))?;
+        
+        // # Security
+        //
+        // Validate timestamp is within reasonable bounds to prevent issues with
+        // time-based logic elsewhere in the codebase.
+        //
+        // Bitcoin genesis: 2009-01-03 18:15:05 UTC (timestamp: 1231006505)
+        // We use 2008-10-31 (Bitcoin whitepaper publication) as the lower bound.
+        const MIN_TIMESTAMP: i64 = 1225497600; // 2008-11-01 00:00:00 UTC
+        
+        // Allow timestamps up to 2 hours in the future to account for clock skew.
+        // This matches zcashd's MAX_FUTURE_BLOCK_TIME_MTP for blocks.
+        let now = Utc::now().timestamp();
+        const MAX_TIMESTAMP_SKEW_SECS: i64 = 2 * 60 * 60; // 2 hours
+        let max_timestamp = now + MAX_TIMESTAMP_SKEW_SECS;
+        
+        if timestamp_i64 < MIN_TIMESTAMP {
+            return Err(Error::Parse(
+                "version timestamp is before minimum valid time (2008-11-01)",
+            ));
+        }
+        
+        if timestamp_i64 > max_timestamp {
+            // Log this but don't fail, to match zcashd behavior
+            // which accepts version messages with future timestamps
+            debug!(
+                ?timestamp,
+                ?now,
+                skew_secs = timestamp_i64 - now,
+                "received version message with timestamp far in the future"
+            );
+        }
+        
+        let address_recv = AddrInVersion::zcash_deserialize(&mut reader)?;
+        let address_from = AddrInVersion::zcash_deserialize(&mut reader)?;
+        let nonce = Nonce(reader.read_u64::<LittleEndian>()?);
+        
+        let user_agent = {
+            let byte_count: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
+            let byte_count: usize = byte_count.into();
+
+            // # Security
+            //
+            // Limit peer set memory usage, Zebra stores an `Arc<VersionMessage>` per
+            // connected peer.
+            //
+            // Without this check, we can use `200 peers * 2 MB message size limit = 400 MB`.
+            if byte_count > MAX_USER_AGENT_LENGTH {
+                return Err(Error::Parse(
+                    "user agent too long: must be 256 bytes or less",
+                ));
+            }
+
+            zcash_deserialize_string_external_count(byte_count, &mut reader)?
+        };
+        
+        let start_height = block::Height(reader.read_u32::<LittleEndian>()?);
+        
+        let relay = match reader.read_u8() {
+            Ok(val @ 0..=1) => val == 1,
+            Ok(_) => return Err(Error::Parse("non-bool value supplied in relay field")),
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => true,
+            Err(err) => Err(err)?,
+        };
+        
         Ok(VersionMessage {
-            version: Version(reader.read_u32::<LittleEndian>()?),
-            // Use from_bits_truncate to discard unknown service bits.
-            services: PeerServices::from_bits_truncate(reader.read_u64::<LittleEndian>()?),
-            timestamp: Utc
-                .timestamp_opt(reader.read_i64::<LittleEndian>()?, 0)
-                .single()
-                .ok_or(Error::Parse(
-                    "version timestamp is out of range for DateTime",
-                ))?,
-            address_recv: AddrInVersion::zcash_deserialize(&mut reader)?,
-            address_from: AddrInVersion::zcash_deserialize(&mut reader)?,
-            nonce: Nonce(reader.read_u64::<LittleEndian>()?),
-            user_agent: {
-                let byte_count: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
-                let byte_count: usize = byte_count.into();
-
-                // # Security
-                //
-                // Limit peer set memory usage, Zebra stores an `Arc<VersionMessage>` per
-                // connected peer.
-                //
-                // Without this check, we can use `200 peers * 2 MB message size limit = 400 MB`.
-                if byte_count > MAX_USER_AGENT_LENGTH {
-                    return Err(Error::Parse(
-                        "user agent too long: must be 256 bytes or less",
-                    ));
-                }
-
-                zcash_deserialize_string_external_count(byte_count, &mut reader)?
-            },
-            start_height: block::Height(reader.read_u32::<LittleEndian>()?),
-            relay: match reader.read_u8() {
-                Ok(val @ 0..=1) => val == 1,
-                Ok(_) => return Err(Error::Parse("non-bool value supplied in relay field")),
-                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => true,
-                Err(err) => Err(err)?,
-            },
+            version,
+            services,
+            timestamp,
+            address_recv,
+            address_from,
+            nonce,
+            user_agent,
+            start_height,
+            relay,
         }
         .into())
     }
@@ -640,12 +688,25 @@ impl Codec {
             ));
         }
 
+        let original_count = addrs.len();
+        
         // Convert the received address format to Zebra's internal `MetaAddr`,
         // ignoring unsupported network IDs.
-        let addrs = addrs
+        let addrs: Vec<_> = addrs
             .into_iter()
             .filter_map(|addr| addr.try_into().ok())
             .collect();
+        
+        // Track how many addresses were filtered out (unsupported network IDs).
+        // This helps detect peers sending spam addresses or future protocol changes.
+        let filtered_count = original_count - addrs.len();
+        if filtered_count > 0 {
+            if let Some(label) = self.builder.metrics_addr_label.as_ref() {
+                metrics::counter!("zcash.net.in.addrv2.unsupported", "addr" => label.clone())
+                    .increment(filtered_count as u64);
+            }
+        }
+        
         Ok(Message::Addr(addrs))
     }
 
