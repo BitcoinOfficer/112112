@@ -1,0 +1,11 @@
+{
+  "blacklisted": [],
+  "phases_completed": [
+    "crash_deduplication",
+    "unsafe_block_audit",
+    "symbolic_execution"
+  ],
+  "last_update": "2026-05-14T19:41:51.544091",
+  "vulnerabilities_found": 0,
+  "days_since_novel": 0
+}
