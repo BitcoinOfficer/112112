@@ -2,4 +2,5 @@
 
 use super::*;
 
+mod branch_coverage;
 mod vectors;
