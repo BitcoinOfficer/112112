@@ -1,50 +1,120 @@
 # Zebra Security Audit Report
 
-**Date:** May 14, 2026  
-**Scope:** Full codebase security review of the Zebra Zcash full node implementation  
-**Auditor:** Zebra Autonomous Dynamic Audit Engine  
+**Date:** 2026-05-14  
+**Scope:** Full codebase — network protocol, serialization, consensus, RPC, FFI, state, peer management  
+**Methodology:** Manual static analysis of all attack-surface code paths
 
 ---
 
 ## Executive Summary
 
-Zebra is a well-engineered Zcash full node implementation in Rust with strong security foundations. The workspace-level `deny(unsafe_code)` lint (with a single, justified exception in `zebra-script`) eliminates entire classes of memory safety vulnerabilities. The codebase demonstrates consistent application of defense-in-depth principles across network parsing, deserialization, and peer management.
-
-This audit identified **0 critical vulnerabilities**, **3 medium-severity findings**, and **8 low-severity/informational findings**. The medium findings relate to potential denial-of-service vectors and a subtle correctness issue in sigop counting.
-
----
-
-## Audit Methodology
-
-The audit covered the following attack surfaces:
-
-1. **Network Protocol Parsing** (`zebra-network/src/protocol/external/codec.rs`)
-2. **Peer Connection Management** (`zebra-network/src/peer/connection.rs`, `handshake.rs`)
-3. **Deserialization & Memory Safety** (`zebra-chain/src/serialization/`)
-4. **FFI Boundary** (`zebra-script/src/lib.rs`)
-5. **RPC Server** (`zebra-rpc/src/server/`, `methods.rs`)
-6. **Consensus Verification** (`zebra-consensus/`)
-7. **State Management** (`zebra-state/`)
-8. **Integer Arithmetic Safety** (workspace-wide `as` cast audit)
-9. **Authentication & Authorization** (`zebra-rpc/src/server/cookie.rs`)
-10. **DoS Resistance** (rate limiting, connection management, memory bounds)
+Zebra demonstrates strong security engineering overall. The codebase uses Rust's type system effectively, denies `unsafe_code` workspace-wide (except the necessary FFI in `zebra-script`), and implements defense-in-depth patterns including `TrustedPreallocate`, `CompactSizeMessage` bounds, connection rate-limiting, and misbehavior scoring. The audit identified **no critical exploitable vulnerabilities** but found several areas of concern ranging from medium to informational severity.
 
 ---
 
 ## Findings
 
-### MEDIUM Severity
+### FINDING 1 — `filteradd` Message Silently Truncates Oversized Data (Low)
 
-#### M-1: `p2sh_sigop_count` Silent Undercount on Length Mismatch
-
-**File:** `zebra-script/src/lib.rs:283-303`  
-**Severity:** Medium  
-**Category:** Consensus Correctness  
+**File:** `zebra-network/src/protocol/external/codec.rs` (line ~560)
 
 **Description:**  
-The `p2sh_sigop_count` function uses `zip()` to pair transaction inputs with spent outputs. If `spent_outputs.len() != tx.inputs().len()` for a non-coinbase transaction, `zip()` silently truncates the longer iterator, producing an **undercount** of P2SH sigops. This could allow a block with more sigops than `MAX_BLOCK_SIGOPS` to pass validation.
+The `read_filteradd` method silently truncates the body to `MAX_FILTERADD_LENGTH` (520 bytes) using `min(body_len, MAX_FILTERADD_LENGTH)` rather than rejecting oversized messages with an error. While Zebra ignores BIP37 filter messages entirely (they are consumed as `Consumed` in the connection handler), this silent truncation deviates from the BIP37 specification which states that data elements larger than 520 bytes should be rejected.
 
-The code has a `debug_assert_eq!` that catches this in debug builds, but in release builds the mismatch is silently ignored.
+```rust
+fn read_filteradd<R: Read>(&self, mut reader: R, body_len: usize) -> Result<Message, Error> {
+    const MAX_FILTERADD_LENGTH: usize = 520;
+    // Silent truncation instead of rejection:
+    let filter_length: usize = min(body_len, MAX_FILTERADD_LENGTH);
+    let filter_bytes = zcash_deserialize_bytes_external_count(filter_length, &mut reader)?;
+    Ok(Message::FilterAdd { data: filter_bytes })
+}
+```
+
+**Impact:** Low. Zebra ignores filter messages, so this is defense-in-depth only. However, if filter support is ever added, this would become a protocol compliance issue.
+
+**Recommendation:** Reject messages where `body_len > MAX_FILTERADD_LENGTH` with a parse error, consistent with `filterload` handling.
+
+---
+
+### FINDING 2 — Handshake Loops on Non-Version/Non-Verack Messages Without Bound (Medium)
+
+**File:** `zebra-network/src/peer/handshake.rs` (lines ~430-445, ~480-495)
+
+**Description:**  
+During the handshake, `negotiate_version` waits for a `Version` message and then a `Verack` message. If the remote peer sends non-Version (or non-Verack) messages, the code loops indefinitely, reading and discarding messages:
+
+```rust
+let mut remote_msg = peer_conn.next().await.ok_or(HandshakeError::ConnectionClosed)??;
+// Wait for next message if the one we got is not Version
+let remote: VersionMessage = loop {
+    match remote_msg {
+        Message::Version(version_message) => { break version_message; }
+        _ => {
+            remote_msg = peer_conn.next().await.ok_or(HandshakeError::ConnectionClosed)??;
+            debug!(?remote_msg, "ignoring non-version message from remote peer");
+        }
+    }
+};
+```
+
+While the outer `Handshake::call` wraps the entire handshake in a `HANDSHAKE_TIMEOUT` (3 seconds), a malicious peer could send a stream of valid non-Version messages (e.g., `Ping` messages) to keep the handshake task alive for the full timeout duration, consuming resources (a task slot, a TCP connection, memory for decoded messages).
+
+**Impact:** Medium. An attacker can hold handshake resources for up to 3 seconds per connection. Combined with the inbound connection rate limit (1 per second), this limits the attack to ~3 concurrent stalled handshakes, which is manageable. However, the unbounded loop is architecturally concerning.
+
+**Recommendation:** Add a counter to limit the number of non-Version/non-Verack messages accepted during handshake (e.g., max 3), and disconnect peers that exceed it.
+
+---
+
+### FINDING 3 — Misbehavior Score Not Incremented for Many Consensus Violations (Low-Medium)
+
+**File:** `zebra-consensus/src/error.rs` (lines ~263-310, ~401-414)
+
+**Description:**  
+The `TransactionError::mempool_misbehavior_score()` and `BlockError::misbehavior_score()` methods return `0` for many error variants via the `_other => 0` catch-all. This means peers that send transactions or blocks with the following errors receive no misbehavior penalty:
+
+- `TransactionError::LockedUntilAfterBlockHeight` / `LockedUntilAfterBlockTime`
+- `TransactionError::ExpiredTransaction`
+- `TransactionError::MaximumExpiryHeight`
+- `TransactionError::NotCoinbase`
+- `TransactionError::InternalDowncastError`
+- `BlockError::NoTransactions`
+- `BlockError::BadMerkleRoot`
+- `BlockError::DuplicateTransaction`
+- `BlockError::WrongTransactionConsensusBranchId`
+- `BlockError::TooManyTransparentSignatureOperations`
+
+Some of these (e.g., `BadMerkleRoot`, `DuplicateTransaction`, `TooManyTransparentSignatureOperations`) are clear indicators of malicious or broken peers and should carry a non-zero misbehavior score.
+
+**Impact:** Low-Medium. Malicious peers can repeatedly send invalid blocks/transactions without being banned, wasting verification resources. The existing connection timeout and overload protection partially mitigate this.
+
+**Recommendation:** Assign non-zero misbehavior scores to clearly invalid block/transaction errors. The TODO comment at line 267 (`// TODO: Adjust these values based on zcashd (#9258)`) confirms this is a known gap.
+
+---
+
+### FINDING 4 — `body_len` Cast from `u32` to `usize` in Codec Decoder (Informational)
+
+**File:** `zebra-network/src/protocol/external/codec.rs` (line ~377)
+
+**Description:**  
+```rust
+let body_len = header_reader.read_u32::<LittleEndian>()? as usize;
+```
+
+This `as usize` cast is safe on all current platforms (where `usize >= 32 bits`), and the value is immediately checked against `self.builder.max_len` (which is `MAX_PROTOCOL_MESSAGE_LEN = 2MB`). However, per the project's own coding standards, `as` casts should have a comment explaining why the cast is safe.
+
+**Impact:** Informational. No actual vulnerability.
+
+**Recommendation:** Add a safety comment: `// Safe: u32 always fits in usize on supported platforms`.
+
+---
+
+### FINDING 5 — `p2sh_sigop_count` Uses `zip()` Which Silently Truncates Mismatched Lengths (Low)
+
+**File:** `zebra-script/src/lib.rs` (lines ~370-390)
+
+**Description:**  
+The `p2sh_sigop_count` function uses `tx.inputs().iter().zip(spent_outputs.iter())` to pair inputs with their spent outputs. If the lengths don't match, `zip()` silently truncates the longer iterator, potentially undercounting sigops. While there is a `debug_assert_eq!` that catches this in debug builds, it is a no-op in release builds.
 
 ```rust
 debug_assert_eq!(
@@ -55,316 +125,156 @@ debug_assert_eq!(
 
 tx.inputs()
     .iter()
-    .zip(spent_outputs.iter())  // Silent truncation in release builds
+    .zip(spent_outputs.iter())
     .map(|(input, spent_output)| p2sh_input_sigop_count(input, spent_output))
     .sum()
 ```
 
-**Impact:** If a caller passes mismatched lengths, the sigop count will be too low, potentially allowing blocks that exceed the sigop limit. This is a consensus-critical function.
+**Impact:** Low. The callers in `zebra-consensus` are expected to always provide correctly-sized `spent_outputs`. An undercount would allow a block with too many sigops to pass validation, but this requires a bug in the calling code, not an external attack.
 
-**Recommendation:** Replace `debug_assert_eq!` with a hard error return or `assert_eq!` in release builds. Alternatively, return an error type instead of `u32`:
+**Recommendation:** Consider using `assert_eq!` instead of `debug_assert_eq!`, or return an error when lengths don't match, to make this a hard invariant in release builds.
+
+---
+
+### FINDING 6 — Sighash Callback Returns Random Bytes on Failure Instead of Propagating Error (Low)
+
+**File:** `zebra-script/src/lib.rs` (lines ~240-260)
+
+**Description:**  
+When the sighash computation fails (e.g., invalid hash type for v5 transactions, or SIGHASH_SINGLE without a corresponding output), the callback returns a randomly-generated 32-byte value instead of propagating the error:
 
 ```rust
-pub fn p2sh_sigop_count(
-    tx: &Transaction,
-    spent_outputs: &[transparent::Output],
-) -> Result<u32, Error> {
-    if tx.is_coinbase() {
-        return Ok(0);
-    }
-    if tx.inputs().len() != spent_outputs.len() {
-        return Err(Error::TxIndex);
+Some(computed.unwrap_or_else(|| {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes
+}))
+```
+
+The code comment explains this is a workaround because `libzcash_script`'s callback API doesn't propagate failure. While the random value makes signature verification fail with overwhelming probability, this is a probabilistic defense rather than a deterministic one.
+
+**Impact:** Low. The probability of a random 32-byte value matching a valid sighash is negligible (2^-256). The code correctly documents this as a workaround.
+
+**Recommendation:** Track the upstream `libzcash_script` fix to propagate callback failures, and remove this workaround when available.
+
+---
+
+### FINDING 7 — Inbound Peer Limit Multiplier Creates Eclipse Attack Surface (Informational — Documented)
+
+**File:** `zebra-network/src/constants.rs` (lines ~40-60)
+
+**Description:**  
+The `INBOUND_PEER_LIMIT_MULTIPLIER` (5x) is significantly higher than `OUTBOUND_PEER_LIMIT_MULTIPLIER` (3x). With a default target of 25 peers, this means up to 125 inbound connections vs 75 outbound. An attacker controlling many IP addresses could become a majority of a node's peers through inbound connections.
+
+**Impact:** Informational. This is a documented security tradeoff (the code comments explicitly discuss this). The `DEFAULT_MAX_CONNS_PER_IP` (1) and the misbehavior banning system partially mitigate this.
+
+**Recommendation:** Already documented. Consider adding monitoring/alerting when inbound connections significantly outnumber outbound connections.
+
+---
+
+### FINDING 8 — `Addr` Message Deserialization Checks Count After Full Deserialization (Low)
+
+**File:** `zebra-network/src/protocol/external/codec.rs` (lines ~440-455)
+
+**Description:**  
+In `read_addr` and `read_addrv2`, the address count limit check happens *after* the full vector has been deserialized:
+
+```rust
+fn read_addr<R: Read>(&self, reader: R) -> Result<Message, Error> {
+    let addrs: Vec<AddrV1> = reader.zcash_deserialize_into()?;
+    if addrs.len() > constants::MAX_ADDRS_IN_MESSAGE {
+        return Err(Error::Parse("more than MAX_ADDRS_IN_MESSAGE in addr message"));
     }
     // ...
 }
 ```
 
+The `TrustedPreallocate` implementation for `AddrV1` already limits allocation to `MAX_ADDRS_IN_MESSAGE`, so the post-deserialization check is redundant defense-in-depth. However, the deserialization still allocates and processes all addresses before the check.
+
+**Impact:** Low. The `TrustedPreallocate` bound prevents excessive allocation. The post-check is defense-in-depth.
+
+**Recommendation:** No change needed — the layered defense is appropriate.
+
 ---
 
-#### M-2: `filteradd` Message Body Length Not Fully Validated
+### FINDING 9 — `assert!` in `Addr` Message Encoding Could Panic on Malformed Internal State (Low)
 
-**File:** `zebra-network/src/protocol/external/codec.rs` (in `read_filteradd`)  
-**Severity:** Medium  
-**Category:** Protocol Parsing / DoS  
+**File:** `zebra-network/src/protocol/external/codec.rs` (line ~195)
 
 **Description:**  
-The `read_filteradd` method uses `min(body_len, MAX_FILTERADD_LENGTH)` to cap the read length, but does **not** reject messages where `body_len > MAX_FILTERADD_LENGTH`. According to BIP 37, data elements larger than 520 bytes should be rejected. Instead, Zebra silently truncates the data to 520 bytes and accepts the message.
+The `write_body` method for `Message::Addr` uses `assert!` to check the address count:
 
 ```rust
-fn read_filteradd<R: Read>(&self, mut reader: R, body_len: usize) -> Result<Message, Error> {
-    const MAX_FILTERADD_LENGTH: usize = 520;
-    // Memory Denial of Service: limit the untrusted parsed length
-    let filter_length: usize = min(body_len, MAX_FILTERADD_LENGTH);
-    let filter_bytes = zcash_deserialize_bytes_external_count(filter_length, &mut reader)?;
-    Ok(Message::FilterAdd { data: filter_bytes })
+Message::Addr(addrs) => {
+    assert!(
+        addrs.len() <= constants::MAX_ADDRS_IN_MESSAGE,
+        "unexpectedly large Addr message: greater than MAX_ADDRS_IN_MESSAGE addresses"
+    );
+    // ...
 }
 ```
 
-**Impact:** While Zebra ignores filter messages (noted in the code), accepting malformed messages without error could mask protocol violations. The remaining `body_len - 520` bytes are left unconsumed in the body, but since the body was already split off, this is benign. However, the truncation means the `FilterAdd` message contains different data than what the peer sent.
+If internal code ever constructs an `Addr` message with too many addresses, this will panic and crash the node. While this should never happen in correct code, a `return Err(...)` would be more resilient.
 
-**Recommendation:** Reject `filteradd` messages where `body_len > MAX_FILTERADD_LENGTH`:
+**Impact:** Low. This is an internal invariant check. The `Addr` response path in `connection.rs` doesn't enforce this limit before constructing the message, but the `update_addr_cache` method limits responses to `PEER_ADDR_RESPONSE_LIMIT`.
 
-```rust
-if body_len > MAX_FILTERADD_LENGTH {
-    return Err(Error::Parse("filteradd data too long: must be 520 bytes or less"));
-}
-```
+**Recommendation:** Consider replacing the `assert!` with `return Err(Error::Parse(...))` for resilience.
 
 ---
 
-#### M-3: Inbound Peer Eclipse via High Inbound-to-Outbound Ratio
+### FINDING 10 — RPC Cookie Authentication is Optional and Disabled by Default (Informational)
 
-**File:** `zebra-network/src/constants.rs:63-67`  
-**Severity:** Medium  
-**Category:** Network Security / Eclipse Attack  
+**File:** `zebra-rpc/src/server.rs` (lines ~120-130)
 
 **Description:**  
-The `INBOUND_PEER_LIMIT_MULTIPLIER` is 5x while `OUTBOUND_PEER_LIMIT_MULTIPLIER` is 3x. With the default `peerset_initial_target_size` of 25, this means:
-- Outbound limit: 75 peers (chosen by Zebra)
-- Inbound limit: 125 peers (chosen by attackers)
+The RPC server's cookie-based authentication (`enable_cookie_auth`) is optional and defaults to disabled. When disabled, any process that can reach the RPC port can execute all RPC methods, including `submitblock` and `sendrawtransaction`.
 
-An attacker controlling 126+ IP addresses can fill all inbound slots, achieving a **62.5% majority** of the node's peer connections (125 / 200). Combined with the `DEFAULT_MAX_CONNS_PER_IP = 1` limit, this requires 125 distinct IPs, which is feasible for a well-resourced attacker.
+**Impact:** Informational. The RPC server defaults to `http_only()` and typically listens on localhost. However, in containerized or cloud environments, localhost binding may not provide sufficient isolation.
 
-The code comments acknowledge this tradeoff explicitly:
-
-> "This means that an attacker can easily become a majority of a node's peers."
-
-**Impact:** An attacker with sufficient IP addresses can eclipse a Zebra node, controlling the majority of its peer connections. This could enable double-spend attacks, transaction censorship, or delayed block propagation.
-
-**Recommendation:** Consider reducing `INBOUND_PEER_LIMIT_MULTIPLIER` to 2x or 3x, or implementing additional eclipse resistance measures such as:
-- Anchor connections (persistent outbound connections to trusted peers)
-- Subnet diversity requirements for inbound connections
-- Eviction of inbound peers that don't provide useful data
+**Recommendation:** Document the security implications of running without cookie auth, especially in production environments. Consider making cookie auth the default.
 
 ---
 
-### LOW Severity / Informational
+## Positive Security Observations
 
-#### L-1: RPC Cookie Authentication Uses Non-Constant-Time Comparison
+1. **`unsafe_code = "deny"` workspace-wide** — Only `zebra-script` allows unsafe code for FFI, and it's well-contained.
 
-**File:** `zebra-rpc/src/server/cookie.rs:26-28`  
-**Severity:** Low  
-**Category:** Cryptographic Implementation  
+2. **`TrustedPreallocate` pattern** — All deserialized vectors from network data use bounded preallocation, preventing memory DoS.
 
-**Description:**  
-The `authenticate` method uses `==` (derived `PartialEq` on `String`) for cookie comparison, which is not constant-time:
+3. **`CompactSizeMessage` bounded to `MAX_PROTOCOL_MESSAGE_LEN`** — Prevents oversized allocations at the serialization layer.
 
-```rust
-pub fn authenticate(&self, passwd: String) -> bool {
-    *passwd == self.0
-}
-```
+4. **Connection rate limiting** — Both inbound and outbound connections are rate-limited with configurable intervals.
 
-**Impact:** A local attacker with network access to the RPC port could theoretically perform a timing side-channel attack to recover the cookie value byte-by-byte. However, the cookie is 32 random bytes (base64-encoded to 44 characters), and the RPC server defaults to `127.0.0.1`, limiting the attack surface to local processes.
+5. **Misbehavior scoring and IP banning** — Peers exceeding `MAX_PEER_MISBEHAVIOR_SCORE` (100) are banned, with a bounded ban list (`MAX_BANNED_IPS = 20,000`).
 
-**Recommendation:** Use a constant-time comparison function:
+6. **Timestamp truncation** — Outbound address timestamps are truncated to 30-minute intervals to prevent timing attacks.
 
-```rust
-use subtle::ConstantTimeEq;
+7. **Nonce-based self-connection detection** — The handshake uses random nonces to detect and reject self-connections.
 
-pub fn authenticate(&self, passwd: String) -> bool {
-    self.0.as_bytes().ct_eq(passwd.as_bytes()).into()
-}
-```
+8. **Overload protection with probabilistic disconnection** — The `handle_inbound_overload` method uses a quadratic probability curve to disconnect peers that repeatedly trigger overload, making sustained DoS harder.
+
+9. **Address book security** — Address book updates are based on outbound connections only, preventing malicious peers from poisoning the address book via inbound connections.
+
+10. **Checksum verification** — All network messages are verified against SHA256d checksums before processing.
 
 ---
 
-#### L-2: `block_in_place` in Network Codec May Block Tokio Runtime
+## Summary Table
 
-**File:** `zebra-network/src/protocol/external/codec.rs` (in `deserialize_transaction_spawning` and `deserialize_block_spawning`)  
-**Severity:** Low  
-**Category:** Performance / Availability  
-
-**Description:**  
-Block and transaction deserialization uses `tokio::task::block_in_place()` combined with `rayon::in_place_scope_fifo()`. The `block_in_place` call blocks the current tokio worker thread, which can reduce the runtime's capacity to handle other connections. The code comments acknowledge this:
-
-> "Since we use `block_in_place()`, other futures running on the connection task will be blocked"
-
-**Impact:** Under heavy load with many simultaneous block/transaction messages, this could reduce the responsiveness of other peer connections sharing the same tokio worker thread.
-
-**Recommendation:** Consider using `spawn_blocking` with owned data (by reading the message body into a `Vec<u8>` first), or accept the current tradeoff with documentation.
-
----
-
-#### L-3: Handshake Nonce Collision Detection Uses Shared Mutex
-
-**File:** `zebra-network/src/peer/handshake.rs:82`  
-**Severity:** Low  
-**Category:** Concurrency  
-
-**Description:**  
-The `nonces` field uses `Arc<futures::lock::Mutex<IndexSet<Nonce>>>` shared across all handshakes. Under high connection rates, this mutex could become a bottleneck. Additionally, the nonce set grows unboundedly if nonces are never removed after handshake completion.
-
-**Impact:** Minor performance impact under high connection rates. The nonce set size is bounded by the number of concurrent handshakes (which is bounded by connection limits), so memory impact is negligible.
-
-**Recommendation:** Ensure nonces are removed after handshake completion. Consider using a `DashSet` or similar concurrent set for better performance under contention.
+| # | Finding | Severity | Status |
+|---|---------|----------|--------|
+| 1 | `filteradd` silent truncation | Low | New |
+| 2 | Handshake unbounded non-Version loop | Medium | New |
+| 3 | Missing misbehavior scores for many errors | Low-Medium | Known (TODO) |
+| 4 | Missing safety comment on `as usize` cast | Informational | New |
+| 5 | `p2sh_sigop_count` silent truncation via `zip()` | Low | New |
+| 6 | Random sighash on callback failure | Low | Known (workaround) |
+| 7 | Inbound peer limit eclipse surface | Informational | Documented |
+| 8 | Post-deserialization addr count check | Low | Defense-in-depth |
+| 9 | `assert!` in Addr encoding | Low | New |
+| 10 | RPC cookie auth disabled by default | Informational | By design |
 
 ---
 
-#### L-4: `MAX_PROTOCOL_MESSAGE_LEN` as Defense-in-Depth for CompactSize
-
-**File:** `zebra-chain/src/serialization/compact_size.rs`  
-**Severity:** Informational  
-**Category:** Defense-in-Depth  
-
-**Description:**  
-`CompactSizeMessage` correctly limits values to `MAX_PROTOCOL_MESSAGE_LEN` (2 MiB). This is a strong defense-in-depth measure. However, individual `TrustedPreallocate` implementations provide tighter bounds per type. The two-layer defense is well-designed and correctly implemented.
-
-**Status:** No action needed. This is a positive finding.
-
----
-
-#### L-5: Unknown Network Messages Are Silently Ignored
-
-**File:** `zebra-network/src/protocol/external/codec.rs` (in `Decoder::decode`)  
-**Severity:** Informational  
-**Category:** Protocol Compliance  
-
-**Description:**  
-Unknown message commands return `Ok(None)` rather than an error. The code includes a security comment explaining this is intentional to prevent DoS/eclipse attacks via connection closure. This is the correct behavior.
-
-```rust
-_ => {
-    // # Security
-    // Zcash connections are not authenticated, so malicious nodes can
-    // send fake messages...
-    debug!(?command, %command_string, "unknown message command from peer");
-    return Ok(None);
-}
-```
-
-**Status:** No action needed. This is a positive finding demonstrating security awareness.
-
----
-
-#### L-6: RPC `listen_addr` Security Warning
-
-**File:** `zebra-rpc/src/config/rpc.rs:31-33`  
-**Severity:** Informational  
-**Category:** Configuration Security  
-
-**Description:**  
-The RPC config includes a security warning about binding to public IP addresses. The default is `None` (disabled), and cookie authentication is enabled by default. The symlink check in `cookie::write_to_disk` prevents symlink attacks on the cookie file. File permissions are set to `0o600` on Unix.
-
-**Status:** Well-implemented. The defense-in-depth approach (disabled by default + cookie auth + restrictive permissions + symlink check) is thorough.
-
----
-
-#### L-7: Overload Protection Probability Calculation
-
-**File:** `zebra-network/src/peer/connection.rs:1640-1670`  
-**Severity:** Informational  
-**Category:** DoS Resistance  
-
-**Description:**  
-The `overload_drop_connection_probability` function uses a quadratic decay model. The probability ranges from `MIN_OVERLOAD_DROP_PROBABILITY` (0.05) to `MAX_OVERLOAD_DROP_PROBABILITY` (0.5). The `OVERLOAD_PROTECTION_INTERVAL` is set to `MIN_INBOUND_PEER_CONNECTION_INTERVAL` (1 second).
-
-This means:
-- First overload: 5% chance of disconnection
-- Second overload within 1 second: up to 50% chance
-- Rapid successive overloads: increasingly likely to disconnect
-
-**Status:** Well-designed. The probabilistic approach prevents both DoS via overload and DoS via excessive disconnection.
-
----
-
-#### L-8: `as` Cast Safety in Serialization Code
-
-**File:** Various files in `zebra-chain/src/`  
-**Severity:** Informational  
-**Category:** Integer Safety  
-
-**Description:**  
-The workspace lint configuration includes `checked_conversions = "warn"` and `unnecessary_cast = "warn"`, which helps catch unsafe integer conversions. The `as` casts found in the codebase are predominantly in test code or in contexts where the cast is provably safe (e.g., `MAX_BLOCK_SUBSIDY: u64 = ((25 * COIN) / 2) as u64` where the value is a compile-time constant).
-
-The `CompactSize64` serialization uses `as` casts that are safe because they are in match arms that have already validated the range:
-
-```rust
-0x00..=0xfc => writer.write_u8(n as u8),        // n <= 0xfc, fits in u8
-0x00fd..=0xffff => writer.write_u16::<LE>(n as u16),  // n <= 0xffff, fits in u16
-```
-
-**Status:** No action needed. The casts are safe within their match arm contexts.
-
----
-
-## Positive Security Findings
-
-The following security measures are well-implemented and deserve recognition:
-
-### 1. Memory Safety Architecture
-- **`deny(unsafe_code)`** at workspace level eliminates memory corruption vulnerabilities
-- Single `allow(unsafe_code)` in `zebra-script` is justified for FFI and well-documented
-- `TrustedPreallocate` trait prevents memory DoS via deserialization
-
-### 2. Network Protocol Security
-- **Magic number validation** prevents cross-network message injection
-- **Checksum verification** (SHA-256d) prevents message corruption
-- **Message size limits** (`MAX_PROTOCOL_MESSAGE_LEN = 2 MiB`) prevent memory exhaustion
-- **User agent length limit** (256 bytes) prevents per-connection memory abuse
-- **Address response limits** prevent peer set takeover
-- **Timestamp truncation** (30-minute intervals) prevents timing fingerprinting
-
-### 3. Peer Management Security
-- **Connection rate limiting** (inbound: 1s success, 10ms failure; outbound: 100ms)
-- **Per-IP connection limits** (default: 1)
-- **Peer misbehavior scoring** with disconnection threshold (100)
-- **Banned IP tracking** (up to 20,000 IPs)
-- **Probabilistic overload disconnection** prevents both DoS and self-DoS
-- **Request timeouts** (20 seconds) prevent resource exhaustion
-
-### 4. RPC Security
-- **Disabled by default** — requires explicit configuration
-- **Cookie-based authentication** enabled by default
-- **Restrictive file permissions** (0o600) on cookie file
-- **Symlink attack prevention** on cookie file path
-- **Content-type validation** prevents CSRF via browser forms
-- **Request body size limits** based on `MAX_BLOCK_BYTES`
-- **`deny_unknown_fields`** on config structs prevents config injection
-
-### 5. Consensus Safety
-- **Sighash callback safety**: When the sighash callback cannot compute a valid hash (invalid hash type, missing output for SIGHASH_SINGLE), it returns a random 32-byte value instead of a fixed sentinel. This prevents an attacker from constructing a signature that verifies against a known sentinel value.
-- **Canonical CompactSize enforcement**: Non-canonical CompactSize encodings are rejected
-- **Field element validation**: Curve points and scalars are validated on deserialization
-
-### 6. FFI Safety (`zebra-script`)
-- The FFI boundary is well-contained in a single crate
-- Input validation occurs before FFI calls
-- The sighash callback handles edge cases (invalid hash types, missing outputs) safely
-- Error types are non-exhaustive, allowing future extension
-
----
-
-## Architecture Assessment
-
-### Dependency Flow
-The crate dependency hierarchy is correctly enforced:
-```
-zebrad → zebra-consensus → zebra-script
-       → zebra-state
-       → zebra-network
-       → zebra-rpc → zebra-node-services → zebra-chain (sync-only)
-```
-
-This prevents circular dependencies and ensures that lower-level crates don't depend on higher-level ones, which is important for security isolation.
-
-### Error Handling
-The codebase consistently uses `thiserror` for error types with proper `#[from]` and `#[source]` annotations. The `expect()` messages follow the project convention of explaining **why** the invariant holds, which aids in debugging.
-
-### Async Safety
-- CPU-intensive work (crypto, deserialization) is offloaded to `rayon` or `spawn_blocking`
-- All external waits have timeouts
-- `tokio::sync::watch` is preferred over `Mutex` for shared async state
-
----
-
-## Conclusion
-
-Zebra demonstrates a mature security posture with well-designed defense-in-depth measures across all attack surfaces. The Rust type system and workspace-level `deny(unsafe_code)` eliminate entire classes of vulnerabilities. The network protocol parsing is robust with proper bounds checking, and the RPC server has appropriate authentication and access controls.
-
-The three medium-severity findings should be addressed:
-1. **M-1** (sigop undercount) is a consensus correctness issue that should be fixed by making the length check a hard error
-2. **M-2** (filteradd truncation) is a minor protocol compliance issue
-3. **M-3** (eclipse attack surface) is an inherent tradeoff that is already documented, but could benefit from additional mitigations
-
-No critical vulnerabilities were identified. The codebase is well-suited for production use as a Zcash full node.
+*End of audit report.*
